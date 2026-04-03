@@ -61,6 +61,59 @@ private let avWrite: AVWriteFn? = {
 }()
 
 struct DDCControl {
+    /// Cache: maps display index (0, 1, ...) to working AVService
+    private static var serviceCache: [Int: CFTypeRef] = [:]
+    private static var cacheBuilt = false
+
+    /// Build cache by probing which services respond to DDC
+    private static func buildCache() {
+        guard !cacheBuilt else { return }
+        cacheBuilt = true
+        guard let avCreate, let avWrite, let avRead else { return }
+
+        var iter: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                IOServiceMatching("DCPAVServiceProxy"), &iter) == KERN_SUCCESS else { return }
+        defer { IOObjectRelease(iter) }
+
+        var workingIndex = 0
+        var svc = IOIteratorNext(iter)
+        while svc != 0 {
+            defer { IOObjectRelease(svc); svc = IOIteratorNext(iter) }
+
+            guard let av = avCreate(kCFAllocatorDefault, svc)?.takeRetainedValue() else { continue }
+
+            // Probe: try reading brightness
+            var send: [UInt8] = [0x82, 0x01, 0x10]
+            send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
+            guard avWrite(av, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS else { continue }
+            usleep(50000)
+            var reply = [UInt8](repeating: 0, count: 11)
+            guard avRead(av, 0x37, 0x51, &reply, UInt32(reply.count)) == KERN_SUCCESS,
+                  reply[2] == 0x02 else { continue }
+
+            serviceCache[workingIndex] = av
+            workingIndex += 1
+        }
+    }
+
+    /// Get the AVService for a given display ID, mapping by index among external displays
+    private static func serviceFor(displayID: CGDirectDisplayID) -> CFTypeRef? {
+        buildCache()
+
+        // Find this display's index among external displays
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(16, &ids, &count)
+
+        var externalIndex = 0
+        for i in 0..<Int(count) {
+            if ids[i] == displayID { return serviceCache[externalIndex] }
+            if CGDisplayIsBuiltin(ids[i]) == 0 { externalIndex += 1 }
+        }
+        return nil
+    }
+
     /// Read current and max value for a VCP code
     static func read(command: DDCCommand, for displayID: CGDirectDisplayID) -> (current: Int, max: Int)? {
         if let r = readAppleSilicon(command: command, for: displayID) { return r }
@@ -74,64 +127,45 @@ struct DDCControl {
         return writeIntel(command: command, value: value, for: displayID)
     }
 
+    /// Write to ALL DDC-capable displays at once
+    @discardableResult
+    static func writeAll(command: DDCCommand, value: UInt16) -> Bool {
+        buildCache()
+        var any = false
+        for (_, service) in serviceCache {
+            guard let avWrite else { continue }
+            var send: [UInt8] = [0x84, 0x03, command.rawValue, UInt8(value >> 8), UInt8(value & 0xFF)]
+            send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
+            if avWrite(service, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS { any = true }
+        }
+        return any
+    }
+
     // MARK: - Apple Silicon (IOAVService + DCPAVServiceProxy)
 
     private static func readAppleSilicon(command: DDCCommand, for displayID: CGDirectDisplayID) -> (current: Int, max: Int)? {
-        guard let avWrite, let avRead else { return nil }
+        guard let avWrite, let avRead, let service = serviceFor(displayID: displayID) else { return nil }
 
-        for service in avServices() {
-            // Send DDC get VCP request: [length|0x80, 0x01, vcp_code, checksum]
-            var send: [UInt8] = [0x82, 0x01, command.rawValue]
-            send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
+        var send: [UInt8] = [0x82, 0x01, command.rawValue]
+        send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
+        guard avWrite(service, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS else { return nil }
+        usleep(50000)
 
-            guard avWrite(service, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS else { continue }
-            usleep(50000) // 50ms for monitor to process
+        var reply = [UInt8](repeating: 0, count: 11)
+        guard avRead(service, 0x37, 0x51, &reply, UInt32(reply.count)) == KERN_SUCCESS,
+              reply[2] == 0x02 else { return nil }
 
-            // Read reply: [src, length, result_code, error, vcp, type, max_hi, max_lo, cur_hi, cur_lo, chk]
-            var reply = [UInt8](repeating: 0, count: 11)
-            guard avRead(service, 0x37, 0x51, &reply, UInt32(reply.count)) == KERN_SUCCESS,
-                  reply[2] == 0x02 else { continue }
-
-            let maxVal = Int(reply[6]) << 8 | Int(reply[7])
-            let curVal = Int(reply[8]) << 8 | Int(reply[9])
-            return (curVal, maxVal)
-        }
-        return nil
+        let maxVal = Int(reply[6]) << 8 | Int(reply[7])
+        let curVal = Int(reply[8]) << 8 | Int(reply[9])
+        return (curVal, maxVal)
     }
 
     private static func writeAppleSilicon(command: DDCCommand, value: UInt16, for displayID: CGDirectDisplayID) -> Bool {
-        guard let avWrite else { return false }
+        guard let avWrite, let service = serviceFor(displayID: displayID) else { return false }
 
-        for service in avServices() {
-            // DDC set VCP: [length|0x80, 0x03, vcp_code, value_hi, value_lo, checksum]
-            var send: [UInt8] = [0x84, 0x03, command.rawValue, UInt8(value >> 8), UInt8(value & 0xFF)]
-            send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
-
-            if avWrite(service, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS {
-                return true
-            }
-        }
-        return false
-    }
-
-    /// Get all IOAVService instances from DCPAVServiceProxy
-    private static func avServices() -> [CFTypeRef] {
-        guard let avCreate else { return [] }
-        var iter: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault,
-                IOServiceMatching("DCPAVServiceProxy"), &iter) == KERN_SUCCESS else { return [] }
-        defer { IOObjectRelease(iter) }
-
-        var services: [CFTypeRef] = []
-        var svc = IOIteratorNext(iter)
-        while svc != 0 {
-            if let av = avCreate(kCFAllocatorDefault, svc)?.takeRetainedValue() {
-                services.append(av)
-            }
-            IOObjectRelease(svc)
-            svc = IOIteratorNext(iter)
-        }
-        return services
+        var send: [UInt8] = [0x84, 0x03, command.rawValue, UInt8(value >> 8), UInt8(value & 0xFF)]
+        send.append(send.reduce(UInt8(0x6E ^ 0x51), ^))
+        return avWrite(service, 0x37, 0x51, &send, UInt32(send.count)) == KERN_SUCCESS
     }
 
     // MARK: - Intel fallback (IOFramebuffer I2C)

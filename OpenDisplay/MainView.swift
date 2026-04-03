@@ -168,7 +168,18 @@ struct DisplayCard: View {
                         }
                     }
                 } else {
-                    Text("DDC not available").font(.caption).foregroundStyle(.secondary)
+                    Text("DDC not available (HDMI port doesn't support DDC on Apple Silicon)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Use software dimming below, or connect via USB-C/Thunderbolt for DDC.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    // Show software brightness as fallback
+                    HStack {
+                        Image(systemName: "sun.max")
+                        Text("Brightness").font(.caption).frame(width: 70, alignment: .leading)
+                        Slider(value: $softDim, in: 0...1, step: 0.01)
+                            .onChange(of: softDim) { _, v in gammaDimmer.setDimming(factor: v, for: display.id) }
+                        Text("\(Int(softDim * 100))%").frame(width: 36).font(.caption)
+                    }
                 }
             }
 
