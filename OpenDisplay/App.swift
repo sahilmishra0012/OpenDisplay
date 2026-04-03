@@ -12,9 +12,11 @@ struct OpenDisplayApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
-    /// Tracks the last active app before our popover opens
     static var lastActiveApp: NSRunningApplication?
     private var appObserver: Any?
+    private var brightnessTimer: Timer?
+    /// Stores last values for undo
+    static var undoStack: [(command: DDCCommand, value: UInt16, displayID: CGDirectDisplayID)] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // CLI mode
@@ -34,8 +36,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(rootView: MainView())
 
         setupHotkeys()
+        startBrightnessReadout()
 
-        // Track active app changes so we know which app to tile
+        // Track active app changes
         appObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil, queue: .main
@@ -46,7 +49,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   !app.bundleIdentifier!.contains("swift") else { return }
             AppDelegate.lastActiveApp = app
         }
-        // Initialize with current frontmost
         AppDelegate.lastActiveApp = NSWorkspace.shared.runningApplications
             .first { $0.isActive && $0.activationPolicy == .regular }
 
@@ -68,6 +70,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown { popover.performClose(nil) }
         else { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY); NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    // MARK: - Menu bar brightness readout
+
+    private func startBrightnessReadout() {
+        updateBrightnessReadout()
+        brightnessTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.updateBrightnessReadout()
+        }
+    }
+
+    private func updateBrightnessReadout() {
+        let mgr = DisplayManager()
+        guard let ext = mgr.displays.first(where: { !$0.isBuiltIn }) else {
+            statusItem?.button?.title = ""
+            return
+        }
+        if let b = DDCControl.read(command: .brightness, for: ext.id) {
+            statusItem?.button?.title = " \(b.current)%"
+        }
+    }
+
+    // MARK: - Undo
+
+    static func pushUndo(command: DDCCommand, value: UInt16, displayID: CGDirectDisplayID) {
+        undoStack.append((command, value, displayID))
+        if undoStack.count > 20 { undoStack.removeFirst() }
+    }
+
+    @objc func undoLastChange() {
+        guard let last = AppDelegate.undoStack.popLast() else { return }
+        DDCControl.write(command: last.command, value: last.value, for: last.displayID)
+        updateBrightnessReadout()
     }
 
     private func setupHotkeys() {

@@ -4,6 +4,7 @@ struct MainView: View {
     @StateObject private var manager = DisplayManager()
     @StateObject private var profiles = ProfileManager.shared
     @State private var selectedTab = 0
+    @State private var appeared = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,6 +14,7 @@ struct MainView: View {
                 Spacer()
                 Button(action: { manager.refresh() }) {
                     Image(systemName: "arrow.clockwise")
+                        .rotationEffect(.degrees(manager.displays.isEmpty ? 0 : 360))
                 }.buttonStyle(.borderless)
                 Button(action: { NSApp.terminate(nil) }) {
                     Image(systemName: "xmark.circle")
@@ -20,7 +22,7 @@ struct MainView: View {
             }.padding(.horizontal).padding(.top, 12).padding(.bottom, 6)
 
             // Tabs
-            Picker("", selection: $selectedTab) {
+            Picker("", selection: $selectedTab.animation(.easeInOut(duration: 0.2))) {
                 Text("Displays").tag(0)
                 Text("Arrange").tag(1)
                 Text("Night Shift").tag(2)
@@ -33,18 +35,26 @@ struct MainView: View {
             Divider().padding(.top, 6)
 
             ScrollView {
-                switch selectedTab {
-                case 0: DisplaysTab(manager: manager)
-                case 1: ArrangeTab(manager: manager)
-                case 2: NightShiftTab(manager: manager)
-                case 3: WindowTilingTab()
-                case 4: ProfilesTab(manager: manager)
-                case 5: SettingsTab(manager: manager)
-                default: EmptyView()
+                Group {
+                    switch selectedTab {
+                    case 0: DisplaysTab(manager: manager)
+                    case 1: ArrangeTab(manager: manager)
+                    case 2: NightShiftTab(manager: manager)
+                    case 3: WindowTilingTab()
+                    case 4: ProfilesTab(manager: manager)
+                    case 5: SettingsTab(manager: manager)
+                    default: EmptyView()
+                    }
                 }
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .id(selectedTab) // force transition on tab change
             }
+            .animation(.easeInOut(duration: 0.25), value: selectedTab)
         }
         .frame(width: 400, height: 600)
+        .scaleEffect(appeared ? 1 : 0.95)
+        .opacity(appeared ? 1 : 0)
+        .onAppear { withAnimation(.spring(duration: 0.3)) { appeared = true } }
     }
 }
 
@@ -55,8 +65,13 @@ struct DisplaysTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(manager.displays) { display in
+            ForEach(Array(manager.displays.enumerated()), id: \.element.id) { index, display in
                 DisplayCard(display: display, manager: manager)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+                    .animation(.spring(duration: 0.4).delay(Double(index) * 0.08), value: manager.displays.count)
             }
         }.padding()
     }
@@ -273,13 +288,55 @@ struct DDCSlider: View {
     @Binding var value: Double
     let command: DDCCommand
     let displayID: CGDirectDisplayID
+    @State private var displayValue: Double = 0
 
     var body: some View {
         HStack {
             Image(systemName: icon)
+                .foregroundStyle(value > 0 ? .primary : .secondary)
             Slider(value: $value, in: 0...100, step: 1) { Text(label) }
-                .onChange(of: value) { _, v in DDCControl.write(command: command, value: UInt16(v), for: displayID) }
-            Text("\(Int(value))%").frame(width: 36).font(.caption)
+                .onChange(of: value) { old, new in
+                    if abs(new - old) >= 5 {
+                        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+                    }
+                    AppDelegate.pushUndo(command: command, value: UInt16(old), displayID: displayID)
+                    SmoothDDC.transition(command: command, from: old, to: new, for: displayID)
+                }
+            Text("\(Int(value))%")
+                .frame(width: 36).font(.caption.monospacedDigit())
+                .contentTransition(.numericText())
+                .animation(.snappy(duration: 0.2), value: value)
+        }
+    }
+}
+
+/// Smooth DDC value transitions
+enum SmoothDDC {
+    private static var timers: [String: Timer] = [:]
+
+    static func transition(command: DDCCommand, from: Double, to: Double, for displayID: CGDirectDisplayID, duration: Double = 0.3) {
+        let key = "\(displayID)-\(command.rawValue)"
+        timers[key]?.invalidate()
+
+        let diff = abs(to - from)
+        // Skip animation for small changes or direct jumps
+        if diff <= 3 {
+            DDCControl.write(command: command, value: UInt16(to), for: displayID)
+            return
+        }
+
+        let steps = min(Int(diff), 8)
+        let interval = duration / Double(steps)
+        var step = 0
+
+        timers[key] = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+            step += 1
+            let progress = Double(step) / Double(steps)
+            // Ease-out curve
+            let eased = 1 - pow(1 - progress, 2)
+            let current = from + (to - from) * eased
+            DDCControl.write(command: command, value: UInt16(current), for: displayID)
+            if step >= steps { timer.invalidate(); timers.removeValue(forKey: key) }
         }
     }
 }
@@ -481,7 +538,6 @@ struct WindowTilingTab: View {
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
         var windowRef: CFTypeRef?
 
-        // Try focused window first, then first window in list
         if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &windowRef) != .success {
             var windowsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
@@ -490,10 +546,8 @@ struct WindowTilingTab: View {
         }
 
         let win = windowRef as! AXUIElement
-        var pos = CGPoint(x: frame.origin.x, y: NSScreen.screens[0].frame.height - frame.maxY)
-        var size = CGSize(width: frame.width, height: frame.height)
-        if let pv = AXValueCreate(.cgPoint, &pos) { AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, pv) }
-        if let sv = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, sv) }
+        animateWindow(win, to: frame)
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
     }
 
     private func tileGrid(cols: Int, rows: Int) {
@@ -507,32 +561,86 @@ struct WindowTilingTab: View {
         let grid = WindowTiler.GridLayout(columns: cols, rows: rows)
         let frames = grid.frames(in: screen, count: windows.count)
         for (i, win) in windows.enumerated() where i < frames.count {
-            let f = frames[i]
-            var pos = CGPoint(x: f.origin.x, y: NSScreen.screens[0].frame.height - f.maxY)
-            var size = CGSize(width: f.width, height: f.height)
-            if let pv = AXValueCreate(.cgPoint, &pos) { AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, pv) }
-            if let sv = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, sv) }
+            // Stagger animations for a cascade effect
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.05) {
+                animateWindow(win, to: frames[i])
+            }
+        }
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+    }
+
+    /// Animate a window to a target frame in steps
+    private func animateWindow(_ window: AXUIElement, to frame: NSRect, steps: Int = 6, duration: Double = 0.15) {
+        // Read current position/size
+        var curPos = CGPoint.zero
+        var curSize = CGSize.zero
+        if var posRef: CFTypeRef? = nil,
+           AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success {
+            AXValueGetValue(posRef as! AXValue, .cgPoint, &curPos)
+        }
+        if var sizeRef: CFTypeRef? = nil,
+           AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success {
+            AXValueGetValue(sizeRef as! AXValue, .cgSize, &curSize)
+        }
+
+        let targetPos = CGPoint(x: frame.origin.x, y: NSScreen.screens[0].frame.height - frame.maxY)
+        let targetSize = CGSize(width: frame.width, height: frame.height)
+
+        let interval = duration / Double(steps)
+        for step in 1...steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + interval * Double(step)) {
+                let t = Double(step) / Double(steps)
+                let ease = 1 - pow(1 - t, 3) // ease-out cubic
+
+                var pos = CGPoint(
+                    x: curPos.x + (targetPos.x - curPos.x) * ease,
+                    y: curPos.y + (targetPos.y - curPos.y) * ease
+                )
+                var size = CGSize(
+                    width: curSize.width + (targetSize.width - curSize.width) * ease,
+                    height: curSize.height + (targetSize.height - curSize.height) * ease
+                )
+                if let pv = AXValueCreate(.cgPoint, &pos) { AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, pv) }
+                if let sv = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sv) }
+            }
         }
     }
 }
 
 struct TileButton: View {
     let icon: String; let label: String; let action: () -> Void
+    @State private var pressed = false
     var body: some View {
-        Button(action: action) {
+        Button {
+            withAnimation(.spring(duration: 0.15)) { pressed = true }
+            action()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                withAnimation(.spring(duration: 0.15)) { pressed = false }
+            }
+        } label: {
             VStack(spacing: 2) {
                 Image(systemName: icon).font(.title3)
                 Text(label).font(.caption2)
             }.frame(maxWidth: .infinity).padding(.vertical, 6)
-        }.buttonStyle(.bordered).controlSize(.small)
+        }
+        .buttonStyle(.bordered).controlSize(.small)
+        .scaleEffect(pressed ? 0.9 : 1)
     }
 }
 
 struct GridButton: View {
     let cols: Int; let rows: Int; let label: String
+    @State private var pressed = false
     var body: some View {
-        Button(label) { WindowTiler.shared.tileWindows(columns: cols, rows: rows) }
-            .buttonStyle(.bordered).controlSize(.small)
+        Button {
+            withAnimation(.spring(duration: 0.15)) { pressed = true }
+            WindowTiler.shared.tileWindows(columns: cols, rows: rows)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                withAnimation(.spring(duration: 0.15)) { pressed = false }
+            }
+        } label: { Text(label) }
+        .buttonStyle(.bordered).controlSize(.small)
+        .scaleEffect(pressed ? 0.9 : 1)
     }
 }
 
