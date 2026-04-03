@@ -28,6 +28,7 @@ jobs:
             -output build/OpenDisplay.app/Contents/MacOS/OpenDisplay
           cp Info.plist build/OpenDisplay.app/Contents/
           cp OpenDisplay/Entitlements.plist build/OpenDisplay.app/Contents/Resources/
+          if [ -f OpenDisplay/AppIcon.icns ]; then cp OpenDisplay/AppIcon.icns build/OpenDisplay.app/Contents/Resources/; fi
           echo -n "APPL????" > build/OpenDisplay.app/Contents/PkgInfo
 
       - name: Sign (ad-hoc)
@@ -58,3 +59,6 @@ jobs:
             build/*.zip
             build/*.dmg
           generate_release_notes: true
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
