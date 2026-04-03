@@ -299,7 +299,6 @@ struct DDCSlider: View {
                     if abs(new - old) >= 5 {
                         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
                     }
-                    AppDelegate.pushUndo(command: command, value: UInt16(old), displayID: displayID)
                     SmoothDDC.transition(command: command, from: old, to: new, for: displayID)
                 }
             Text("\(Int(value))%")
@@ -649,19 +648,30 @@ struct GridButton: View {
 struct SettingsTab: View {
     @ObservedObject var manager: DisplayManager
     @StateObject private var profiles = ProfileManager.shared
+    @StateObject private var launchAtLogin = LaunchAtLogin.shared
     @StateObject private var als = AmbientLightSync()
     @StateObject private var eventWatcher = DisplayEventWatcher()
     @State private var preventSleep = false
+    @State private var brightnessSync = false
     @State private var exportMessage = ""
     private let sleepPreventer = SleepPreventer()
+    private let sync = BrightnessSync()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Toggle("Launch at Login", isOn: $profiles.launchAtLogin)
+            Toggle("Launch at Login", isOn: $launchAtLogin.isEnabled)
 
             Toggle("Prevent Sleep (external displays)", isOn: $preventSleep)
                 .onChange(of: preventSleep) { _, on in
                     if on { sleepPreventer.preventSleep() } else { sleepPreventer.allowSleep() }
+                }
+
+            Toggle("Sync brightness across displays", isOn: $brightnessSync)
+                .onChange(of: brightnessSync) { _, on in
+                    let externals = manager.displays.filter { !$0.isBuiltIn }
+                    if on, let first = externals.first {
+                        sync.start(source: first.id, targets: externals.dropFirst().map(\.id))
+                    } else { sync.stop() }
                 }
 
             Divider()
