@@ -31,6 +31,11 @@ lipo -create \
 # Copy Info.plist
 cp Info.plist "$APP_BUNDLE/Contents/"
 
+# Copy icon
+if [ -f "OpenDisplay/AppIcon.icns" ]; then
+    cp OpenDisplay/AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
+fi
+
 # Copy entitlements
 cp OpenDisplay/Entitlements.plist "$APP_BUNDLE/Contents/Resources/"
 
