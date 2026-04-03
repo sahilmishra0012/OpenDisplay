@@ -544,10 +544,23 @@ struct WindowTilingTab: View {
         .padding()
     }
 
+    /// Find the best target app for tiling (not OpenDisplay)
+    private func targetApp() -> NSRunningApplication? {
+        if let app = AppDelegate.lastActiveApp, app.isTerminated == false { return app }
+        // Fallback: find first regular app with windows that isn't us
+        return NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != "com.opendisplay.app" }
+            .first { app in
+                let ref = AXUIElementCreateApplication(app.processIdentifier)
+                var wins: CFTypeRef?
+                return AXUIElementCopyAttributeValue(ref, kAXWindowsAttribute as CFString, &wins) == .success
+                    && (wins as? [AXUIElement])?.isEmpty == false
+            }
+    }
+
     private func tileFront(_ position: WindowTiler.TilePosition) {
-        guard let screen = NSScreen.main?.visibleFrame else { return }
+        guard let screen = NSScreen.main?.visibleFrame, let app = targetApp() else { return }
         let frame = position.frame(in: screen)
-        guard let app = AppDelegate.lastActiveApp else { return }
 
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
         var windowRef: CFTypeRef?
@@ -560,12 +573,14 @@ struct WindowTilingTab: View {
         }
 
         let win = windowRef as! AXUIElement
-        animateWindow(win, to: frame)
-        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+        var pos = CGPoint(x: frame.origin.x, y: NSScreen.screens[0].frame.height - frame.maxY)
+        var size = CGSize(width: frame.width, height: frame.height)
+        if let pv = AXValueCreate(.cgPoint, &pos) { AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, pv) }
+        if let sv = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, sv) }
     }
 
     private func tileGrid(cols: Int, rows: Int) {
-        guard let app = AppDelegate.lastActiveApp else { return }
+        guard let app = targetApp() else { return }
 
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
         var windowsRef: CFTypeRef?
@@ -646,22 +661,14 @@ struct WindowTilingTab: View {
 
 struct TileButton: View {
     let icon: String; let label: String; let action: () -> Void
-    @State private var pressed = false
     var body: some View {
-        Button {
-            withAnimation(.spring(duration: 0.15)) { pressed = true }
-            action()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                withAnimation(.spring(duration: 0.15)) { pressed = false }
-            }
-        } label: {
+        Button { action() } label: {
             VStack(spacing: 2) {
                 Image(systemName: icon).font(.title3)
                 Text(label).font(.caption2)
             }.frame(maxWidth: .infinity).padding(.vertical, 6)
         }
         .buttonStyle(.bordered).controlSize(.small)
-        .scaleEffect(pressed ? 0.9 : 1)
     }
 }
 
