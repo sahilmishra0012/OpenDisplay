@@ -42,12 +42,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil, queue: .main
         ) { note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app.bundleIdentifier != Bundle.main.bundleIdentifier,
-                  !(app.bundleIdentifier ?? "").contains("swift") else { return }
+                  app.activationPolicy == .regular,
+                  !Self.isOurApp(app) else { return }
             AppDelegate.lastActiveApp = app
         }
+        // Initialize: find the most recent non-self regular app
         AppDelegate.lastActiveApp = NSWorkspace.shared.runningApplications
-            .first { $0.isActive && $0.activationPolicy == .regular }
+            .filter { $0.activationPolicy == .regular && !Self.isOurApp($0) }
+            .first
 
         // URL scheme
         NSAppleEventManager.shared().setEventHandler(
@@ -55,6 +57,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)
         )
+    }
+
+    /// Check if a running app is OpenDisplay (works for .app bundle and swift run)
+    private static func isOurApp(_ app: NSRunningApplication) -> Bool {
+        let bid = app.bundleIdentifier ?? ""
+        if bid == "com.opendisplay.app" { return true }
+        if bid == Bundle.main.bundleIdentifier { return true }
+        if app.executableURL?.lastPathComponent == "OpenDisplay" { return true }
+        // When running via swift run
+        if bid.contains("com.apple.dt") || app.executableURL?.path.contains("swift") == true { return true }
+        return false
     }
 
     // MARK: - Click handling: left = popover, right = quick menu
